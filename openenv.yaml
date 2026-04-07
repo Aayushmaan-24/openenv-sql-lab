@@ -1,0 +1,13 @@
+name: sql-lab
+version: "1.0.0"
+description: Real-world SQL Query Debugging & Optimization Lab for training and evaluating agentic LLMs.
+entrypoint:
+  server: server.app:app
+  client: sql_lab.client:SQLLabClient
+docker:
+  build:
+    context: .
+    dockerfile: server/Dockerfile
+  run:
+    ports:
+      - "8000:8000"

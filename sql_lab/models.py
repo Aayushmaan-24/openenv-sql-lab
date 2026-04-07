@@ -1,27 +1,32 @@
-from dataclasses import dataclass
-from typing import List, Dict, Optional
-from openenv.core import Action, Observation, State
+from typing import Any, Dict, List, Optional
+
+from pydantic import Field
+from openenv.core.env_server.types import Action, Observation, State
 
 
-@dataclass
 class SQLAction(Action):
-    task_id: str                    # "easy", "medium", or "hard"
-    query: str                      # SQL query submitted by the agent
-    explanation: Optional[str] = None
+    """SQL query action for a named task."""
+
+    task_id: str = Field(..., description='Task id: "easy", "medium", or "hard"')
+    query: str = Field(..., description="SQL query to execute")
+    explanation: Optional[str] = Field(None, description="Optional rationale")
 
 
-@dataclass
 class SQLObservation(Observation):
-    schema: str
-    result: Optional[List[Dict]] = None
+    """Observation after executing a SQL query."""
+
+    sql_schema: str = Field(..., description="Database schema description")
+    result: Optional[List[Dict[str, Any]]] = None
     error: Optional[str] = None
     execution_time_ms: Optional[float] = None
-    message: str
+    message: str = Field(default="", description="Status or guidance")
 
 
-@dataclass
 class SQLState(State):
-    episode_id: str
-    task_id: str = ""
-    step_count: int = 0
-    score: float = 0.0
+    """Episode state including per-task best scores for grading."""
+
+    task_id: str = Field(default="", description="Task id from the last step")
+    scores_by_task: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Best score in [0,1] achieved per task this episode",
+    )
