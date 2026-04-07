@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 from openenv.core.env_server import HTTPEnvServer
 
 from sql_lab.models import SQLAction, SQLObservation
@@ -44,6 +45,12 @@ server = HTTPEnvServer(
 )
 
 server.register_routes(app)
+
+
+@app.get("/")
+def root():
+    # Hugging Face Spaces typically opens "/", so provide a friendly landing page.
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/tasks")

@@ -1,3 +1,12 @@
+---
+title: OpenEnv SQL Lab
+emoji: 🧪
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 8000
+---
+
 # OpenEnv SQL Lab
 
 An OpenEnv environment that evaluates practical SQL work: writing, correcting, and refining queries against a small business-style schema (departments, employees, sales). The server exposes the standard OpenEnv API (`reset()` / `step()` / `state()`) over HTTP and WebSocket and includes deterministic graders for each task.
