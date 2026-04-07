@@ -1,93 +1,118 @@
-# OpenEnv SQL Lab — Query Debugging & Optimization
+# OpenEnv SQL Lab
 
-**A real-world OpenEnv environment** for training and evaluating agentic LLMs on SQL query debugging, optimization, and generation.
+An OpenEnv environment that evaluates practical SQL work: writing, correcting, and refining queries against a small business-style schema (departments, employees, sales). The server exposes the standard OpenEnv API (`reset()` / `step()` / `state()`) over HTTP and WebSocket and includes deterministic graders for each task.
 
-## Motivation & Description
+## Tasks
 
-Data engineering and backend development often involve writing complex SQL queries. This environment provides a realistic database schema (Departments, Employees, Sales) and three tasks of increasing difficulty:
+Three graded tasks, ordered by difficulty:
 
-1. **Easy**: Basic data retrieval (Engineering staff).
-2. **Medium**: Aggregation and grouping (department salaries).
-3. **Hard**: JOINs and filtering (high sales performers).
+- **easy**: list employee names in Engineering (`dept_id = 1`)
+- **medium**: return department name + average salary per department
+- **hard**: list employees whose total sales strictly exceed 8000
 
-## Spec definitions
+All task scores are normalized to **0.0–1.0**.
 
-### Action space (`SQLAction`)
+## Typed models
 
-- `task_id`: `"easy"`, `"medium"`, or `"hard"`.
-- `query`: SQL string executed against an in-memory SQLite database.
-- `explanation`: Optional agent rationale.
+- **Action** (`SQLAction`): `task_id`, `query`, optional `explanation`
+- **Observation** (`SQLObservation`): `sql_schema`, `result`, `error`, `execution_time_ms`, `message` (plus OpenEnv `reward`/`done`)
+- **State** (`SQLState`): `scores_by_task` (best score per task in the current episode)
 
-### Observation space (`SQLObservation`)
+## Run locally
 
-- `sql_schema`: Textual schema summary (field is `sql_schema` in the API to avoid clashing with Pydantic’s `schema()` helper).
-- `result`: Row list as dicts, or `null` on error.
-- `error`: Error string if the query failed.
-- `execution_time_ms`: Wall time for the last successful execution.
-- `message`: Status or guidance.
-- `reward`, `done`: Standard OpenEnv fields on observations.
-
-### Reward & grading
-
-- Step rewards include partial credit for column/row overlap, strong penalties for destructive SQL keywords, and episode termination when the task is solved (`reward >= 1.0`) or after 5 steps.
-- Per-task scores in `[0.0, 1.0]` are tracked in state (`scores_by_task`) for the WebSocket session.
-- **HTTP `POST /grader`** (JSON `{"task_id", "query"}`) performs a **stateless** grade on a fresh database (for checklists and tooling).
-
-## Task descriptions
-
-| Task ID | Name | Difficulty | Description |
-|---------|------|------------|-------------|
-| easy | Engineering Staff | Easy | List all names of employees in the Engineering department (`dept_id = 1`). |
-| medium | Department Salaries | Medium | Department names with average employee salary per department. |
-| hard | High Sales Performers | Hard | Employee names with total sales strictly exceeding 8000. |
-
-## Local setup
-
-From this directory (`openenv-sql-lab/`):
+Install:
 
 ```bash
 pip install -e .
-# or: uv run server
 ```
 
-Start the API (WebSocket for agents, HTTP for health/schema/grader):
+Start the server:
 
 ```bash
 uv run server
-# or: python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
+# or:
+python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-### Specification validation
+Health check:
+
+```bash
+curl -s http://127.0.0.1:8000/health
+```
+
+## Validate (OpenEnv)
+
+Local structure:
 
 ```bash
 openenv validate .
 ```
 
-With a server running (optional runtime checks):
+Runtime contract (server must be running):
 
 ```bash
-openenv validate --url http://localhost:8000
+openenv validate --url http://127.0.0.1:8000
+```
+
+## Stateless grader (`POST /grader`)
+
+Example:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/grader \
+  -H 'Content-Type: application/json' \
+  -d '{"task_id":"easy","query":"SELECT name FROM employees WHERE dept_id = 1"}'
 ```
 
 ## Baseline inference (`inference.py`)
 
-The baseline script uses the **OpenAI Python client** against an OpenAI-compatible endpoint (`API_BASE_URL`), with credentials from **`HF_TOKEN`** (or **`OPENAI_API_KEY`** as fallback), and **`MODEL_NAME`**.
+The baseline runner uses the **OpenAI Python client** (`from openai import OpenAI`) against an OpenAI-compatible endpoint configured via environment variables. It interacts with this environment over the OpenEnv client API.
+
+### Environment variables (baseline contract)
+
+- **Required**: `HF_TOKEN`
+- **Optional**:
+  - `OPENENV_BASE_URL` (connect to a running environment server; default: `http://127.0.0.1:8000`)
+  - `LOCAL_IMAGE_NAME` (run the environment using `from_docker_image()` / local Docker image)
+
+Defaults are allowed **only** for:
+
+- `API_BASE_URL = os.getenv("API_BASE_URL", "<your-active-api-base-url>")`
+- `MODEL_NAME = os.getenv("MODEL_NAME", "<your-active-model-name>")`
+
+`HF_TOKEN` must be set explicitly (`HF_TOKEN = os.getenv("HF_TOKEN")`).
+
+Run against a server URL:
 
 ```bash
-export API_BASE_URL="https://router.huggingface.co/v1"   # example
-export HF_TOKEN="hf_..."                                   # or OPENAI_API_KEY
-export MODEL_NAME="meta-llama/Llama-3.3-70B-Instruct"      # example
-export OPENENV_BASE_URL="http://127.0.0.1:8000"            # optional; local server URL
+export HF_TOKEN="hf_..."
+export API_BASE_URL="https://router.huggingface.co/openai/v1"
+export MODEL_NAME="meta-llama/Llama-3.3-70B-Instruct"
+export OPENENV_BASE_URL="http://127.0.0.1:8000"
 
-pip install -e .
 python inference.py
 ```
 
-The script connects over **WebSocket** (`/ws`), runs all three tasks, and prints per-task scores (from episode state) and the mean. Ensure the environment server is already running. Intended to finish **under ~20 minutes** on modest hardware (**2 vCPU / 8 GB**).
+Run by starting a local Docker image (instead of using `OPENENV_BASE_URL`):
+
+```bash
+export HF_TOKEN="hf_..."
+export LOCAL_IMAGE_NAME="sql-lab:latest"
+
+python inference.py
+```
+
+### Stdout format
+
+Stdout is machine-parseable. Each line is exactly one record:
+
+- `START {json}` once at the beginning
+- `STEP {json}` once per environment step
+- `END {json}` once at the end (includes mean and per-task scores)
 
 ## Docker
 
-From `openenv-sql-lab/`:
+Build and run locally:
 
 ```bash
 docker build -f server/Dockerfile -t sql-lab:latest .
@@ -96,23 +121,29 @@ docker run --rm -p 8000:8000 sql-lab:latest
 
 ## Deploy to Hugging Face Spaces (OpenEnv)
 
-1. **Create** a new Space (Docker SDK), tag it appropriately for the hackathon (e.g. topic **`openenv`** if required by the organizer UI).
-2. **Push** this repo (or a copy) to the Space, or use the OpenEnv CLI if configured:
+1. Create a Hugging Face Space using the **Docker** SDK and add the topic/tag **`openenv`** (if required by the organizer UI).
+2. Push the repo to the Space:
 
-   ```bash
-   openenv push --repo-id <your-username>/<space-name>
-   ```
+```bash
+openenv push --repo-id <your-username>/<space-name>
+```
 
-3. **Set Space secrets** to match the inference contract:
-   - `API_BASE_URL` — LLM endpoint.
-   - `MODEL_NAME` — model id.
-   - `HF_TOKEN` — Hugging Face / router token as required by your inference setup.
+3. In Space settings, define the baseline variables/secrets:
+   - `API_BASE_URL`
+   - `MODEL_NAME`
+   - `HF_TOKEN`
 
-4. **Health check**: the Space URL should return **HTTP 200** on `/health`; automated checks typically call **`reset()`** via the OpenEnv HTTP/WebSocket API.
+4. Verify:
+   - Space returns **HTTP 200** on `/health`
+   - `openenv validate --url https://<your-space>.hf.space` passes
+   - `python inference.py` completes and prints an `END` record
 
-5. **Pre-submission**: run **`openenv validate .`**, confirm **`docker build` / `docker run`**, run **`python inference.py`** against your deployed URL (set `OPENENV_BASE_URL` to the Space URL), and verify **`POST /grader`** returns scores in **`0.0`–`1.0`** for sample queries.
+## Submission checklist
 
-## Resource notes
+Before submitting your Space URL:
 
-- Keep inference and environment memory within **~8 GB** and **2 vCPU** where possible.
-- Use efficient models / limits in `inference.py` if you hit timeouts.
+- `openenv validate .` passes
+- `docker build` and `docker run` work
+- `/health` returns 200
+- `/grader` returns scores in **0.0–1.0**
+- `inference.py` completes end-to-end within the resource/time limits (target: < 20 minutes on 2 vCPU / 8 GB)

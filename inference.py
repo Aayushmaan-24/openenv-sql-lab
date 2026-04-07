@@ -1,30 +1,50 @@
 """
-Baseline inference for SQL Lab (OpenAI-compatible API via API_BASE_URL).
+Baseline inference for SQL Lab.
 
-Required env: API_BASE_URL, MODEL_NAME, HF_TOKEN (or OPENAI_API_KEY as fallback).
-Optional: OPENENV_BASE_URL (default http://127.0.0.1:8000) for the OpenEnv server.
+Contract:
+- Required env: HF_TOKEN
+- Defaults allowed: API_BASE_URL, MODEL_NAME
+- Optional env:
+  - OPENENV_BASE_URL (connect to a running server)
+  - LOCAL_IMAGE_NAME (run environment via local Docker image)
+
+Stdout is structured as exactly three record types:
+  START {json}
+  STEP {json}
+  END {json}
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import os
 import sys
+import time
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import OpenAI
+
+from openenv.core.containers.runtime import LocalDockerProvider
 
 from sql_lab.client import SQLLabClient
 from sql_lab.models import SQLAction
 
 load_dotenv()
 
-API_BASE_URL = os.getenv("API_BASE_URL")
-MODEL_NAME = os.getenv("MODEL_NAME")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL", "<your-active-api-base-url>")
+MODEL_NAME = os.getenv("MODEL_NAME", "<your-active-model-name>")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+# URL mode (connect to an already-running OpenEnv server)
 OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL", "http://127.0.0.1:8000")
 
+# Docker-image mode (optional): run env from local image via LocalDockerProvider
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+
 TASK_ORDER = ("easy", "medium", "hard")
+MAX_STEPS_PER_TASK = 5
+MAX_QUERY_CHARS = 600
 
 TASK_DESCRIPTIONS = {
     "easy": "List all names of employees in the Engineering department (dept_id = 1).",
@@ -33,13 +53,24 @@ TASK_DESCRIPTIONS = {
 }
 
 
-async def run_task(task_id: str, env: SQLLabClient, client: AsyncOpenAI) -> float:
-    print(f"\nRunning {task_id.upper()} task...")
-    reset_result = await env.reset()
+def _log(event: str, payload: Dict[str, Any]) -> None:
+    # Deterministic JSON for machine parsing.
+    sys.stdout.write(f"{event} {json.dumps(payload, sort_keys=True)}\n")
+    sys.stdout.flush()
+
+
+def _truncate(s: str, max_chars: int) -> str:
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 3] + "..."
+
+
+def run_task(task_id: str, env: Any, client: OpenAI) -> float:
+    reset_result = env.reset()
     obs = reset_result.observation
     desc = TASK_DESCRIPTIONS[task_id]
 
-    for step in range(5):
+    for step in range(MAX_STEPS_PER_TASK):
         prompt = f"""You are an expert SQL developer.
 Task: {desc}
 Schema: {obs.sql_schema}
@@ -48,7 +79,7 @@ Last error: {obs.error}
 
 Reply ONLY with a valid SQL query inside a ```sql ... ``` block. No explanation."""
 
-        response = await client.chat.completions.create(
+        response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
@@ -59,39 +90,80 @@ Reply ONLY with a valid SQL query inside a ```sql ... ``` block. No explanation.
         else:
             query = content.strip()
 
-        result = await env.step(SQLAction(task_id=task_id, query=query))
+        result = env.step(SQLAction(task_id=task_id, query=query))
         obs = result.observation
-        print(f"Step {step + 1} | Reward: {result.reward} | Done: {result.done}")
+        _log(
+            "STEP",
+            {
+                "task_id": task_id,
+                "step_index": step,
+                "query": _truncate(query, MAX_QUERY_CHARS),
+                "reward": result.reward,
+                "done": bool(result.done),
+                "has_error": bool(getattr(obs, "error", None)),
+            },
+        )
         if result.done:
             break
 
-    st = await env.state()
+    st = env.state()
     final_score = float(st.scores_by_task.get(task_id, 0.0))
-    print(f"{task_id.upper()} FINAL SCORE (episode): {final_score:.3f}")
     return final_score
 
 
-async def main() -> None:
-    if not all([API_BASE_URL, MODEL_NAME, HF_TOKEN]):
-        print(
-            "Missing required environment variables: API_BASE_URL, MODEL_NAME, "
-            "and HF_TOKEN (or OPENAI_API_KEY).",
-            file=sys.stderr,
-        )
+def main() -> None:
+    if not HF_TOKEN:
+        print("Missing required environment variable: HF_TOKEN", file=sys.stderr)
         sys.exit(1)
 
-    client = AsyncOpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
-    scores: list[float] = []
+    start_ts = time.time()
+    _log(
+        "START",
+        {
+            "api_base_url": API_BASE_URL,
+            "model_name": MODEL_NAME,
+            "openenv_base_url": None if LOCAL_IMAGE_NAME else OPENENV_BASE_URL,
+            "local_image_name": LOCAL_IMAGE_NAME,
+            "max_steps_per_task": MAX_STEPS_PER_TASK,
+            "started_at_unix_s": start_ts,
+        },
+    )
 
-    async with SQLLabClient(base_url=OPENENV_BASE_URL) as env:
-        for task_id in TASK_ORDER:
-            score = await run_task(task_id, env, client)
-            scores.append(score)
+    llm = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+
+    provider: Optional[LocalDockerProvider] = None
+    base_url: str
+    if LOCAL_IMAGE_NAME:
+        provider = LocalDockerProvider()
+        base_url = provider.start_container(LOCAL_IMAGE_NAME)
+        provider.wait_for_ready(base_url)
+    else:
+        base_url = OPENENV_BASE_URL
+
+    scores: List[float] = []
+    async_client = SQLLabClient(base_url=base_url, provider=provider)
+    sync_env = async_client.sync()
+    try:
+        with sync_env:
+            for task_id in TASK_ORDER:
+                scores.append(run_task(task_id, sync_env, llm))
+    finally:
+        # Ensure docker container is stopped if we started one.
+        try:
+            sync_env.close()
+        except Exception:
+            pass
 
     mean = sum(scores) / len(scores)
-    print(f"\nBASELINE MEAN SCORE: {mean:.3f}")
-    print("Per-task:", dict(zip(TASK_ORDER, scores)))
+    _log(
+        "END",
+        {
+            "mean_score": mean,
+            "scores_by_task": dict(zip(TASK_ORDER, scores)),
+            "elapsed_s": round(time.time() - start_ts, 6),
+        },
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
